@@ -1,0 +1,14 @@
+# Grid Trading Bot Dependencies
+
+# Core
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Async HTTP
+aiohttp>=3.8.0
+
+# WebSocket
+websockets>=11.0
+
+# Optional: For better performance
+uvloop>=0.17.0;platform_system!="Windows"
