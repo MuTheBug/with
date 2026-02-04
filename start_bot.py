@@ -271,12 +271,22 @@ async def run_bot(mode: str = "custom"):
 
     # Start bot based on mode
     if mode == "native":
-        # Use Binance's native grid algo
+        # Use Binance's native grid algo (may require VIP access)
         print("\n🚀 Starting Binance Native Grid Algo...")
+        print("   Note: Native Algo API may require VIP access.")
+        print("   Will fall back to custom implementation if unavailable.\n")
         bot = BinanceGridAlgoBot(live_config, binance_config)
-        await bot.run()
+        try:
+            await bot.run()
+        except KeyboardInterrupt:
+            print("\n\n🛑 Shutdown requested...")
+        finally:
+            await bot.stop_grid_algo()
+            if bot.client:
+                await bot.client.close()
+            print("✅ Bot stopped successfully")
     else:
-        # Use custom grid bot
+        # Use custom grid bot (recommended)
         print("\n🚀 Starting Custom Grid Bot...")
         bot = LiveGridBot(live_config, binance_config)
 

@@ -138,20 +138,40 @@ class BinanceFuturesREST:
         try:
             if method == "GET":
                 async with self.session.get(url, params=params, headers=headers) as resp:
+                    if resp.status == 404:
+                        raise Exception(f"Endpoint not found: {endpoint}")
+                    if resp.content_type != 'application/json':
+                        text = await resp.text()
+                        raise Exception(f"Invalid response type: {resp.content_type}, status: {resp.status}")
                     data = await resp.json()
             elif method == "POST":
                 async with self.session.post(url, params=params, headers=headers) as resp:
+                    if resp.status == 404:
+                        raise Exception(f"Endpoint not found: {endpoint}")
+                    if resp.content_type != 'application/json':
+                        text = await resp.text()
+                        raise Exception(f"Invalid response type: {resp.content_type}, status: {resp.status}")
                     data = await resp.json()
             elif method == "DELETE":
                 async with self.session.delete(url, params=params, headers=headers) as resp:
+                    if resp.status == 404:
+                        raise Exception(f"Endpoint not found: {endpoint}")
+                    if resp.content_type != 'application/json':
+                        text = await resp.text()
+                        raise Exception(f"Invalid response type: {resp.content_type}, status: {resp.status}")
                     data = await resp.json()
             elif method == "PUT":
                 async with self.session.put(url, params=params, headers=headers) as resp:
+                    if resp.status == 404:
+                        raise Exception(f"Endpoint not found: {endpoint}")
+                    if resp.content_type != 'application/json':
+                        text = await resp.text()
+                        raise Exception(f"Invalid response type: {resp.content_type}, status: {resp.status}")
                     data = await resp.json()
             else:
                 raise ValueError(f"Unsupported method: {method}")
 
-            if 'code' in data and data['code'] != 200:
+            if 'code' in data and data['code'] not in [200, 0]:
                 logger.error(f"API Error: {data}")
                 raise Exception(f"Binance API Error: {data.get('msg', data)}")
 

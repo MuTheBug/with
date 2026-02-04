@@ -757,7 +757,8 @@ class LiveGridBot:
 class BinanceGridAlgoBot:
     """
     Alternative bot using Binance's native Grid Trading Algo API
-    This uses Binance's built-in grid trading feature
+    NOTE: The Algo API requires special access/VIP level on Binance
+    This falls back to custom implementation if algo API is unavailable
     """
 
     def __init__(self, config: LiveGridConfig, binance_config: BinanceConfig):
@@ -765,6 +766,7 @@ class BinanceGridAlgoBot:
         self.binance_config = binance_config
         self.client: Optional[BinanceClient] = None
         self.algo_id: Optional[int] = None
+        self.fallback_bot: Optional[LiveGridBot] = None
 
     async def initialize(self):
         """Initialize the bot"""
@@ -772,7 +774,10 @@ class BinanceGridAlgoBot:
         logger.info("Binance Grid Algo Bot initialized")
 
     async def start_grid_algo(self):
-        """Start Binance's native grid trading algo"""
+        """
+        Start Binance's native grid trading algo
+        NOTE: This API may require VIP access or may not be available
+        """
         try:
             # Get current price
             ticker = await self.client.rest.get_ticker_price(self.config.symbol)
@@ -791,7 +796,8 @@ class BinanceGridAlgoBot:
             )
             quantity = (usdt_balance * 0.9) / current_price  # Use 90% of balance
 
-            # Place grid algo order
+            # Try the algo endpoint (may require VIP access)
+            # Binance Algo API endpoints vary by region and account type
             result = await self.client.rest.place_grid_algo(
                 symbol=self.config.symbol,
                 side='NEUTRAL',
@@ -809,11 +815,23 @@ class BinanceGridAlgoBot:
             return result
 
         except Exception as e:
-            logger.error(f"Failed to start grid algo: {e}")
-            raise
+            logger.warning(f"Binance Algo API not available: {e}")
+            logger.info("Falling back to custom grid implementation...")
+            return await self._fallback_to_custom()
+
+    async def _fallback_to_custom(self):
+        """Fall back to custom grid implementation"""
+        logger.info("Starting custom grid bot as fallback...")
+        self.fallback_bot = LiveGridBot(self.config, self.binance_config)
+        await self.fallback_bot.initialize()
+        return {'status': 'fallback', 'message': 'Using custom grid implementation'}
 
     async def stop_grid_algo(self):
         """Stop the grid algo"""
+        if self.fallback_bot:
+            await self.fallback_bot.stop()
+            return
+
         if self.algo_id:
             try:
                 await self.client.rest.cancel_grid_algo(self.algo_id)
@@ -823,26 +841,44 @@ class BinanceGridAlgoBot:
 
     async def get_algo_status(self) -> Dict:
         """Get current algo status"""
+        if self.fallback_bot:
+            return {'status': 'running', 'mode': 'custom_fallback'}
+
         if self.algo_id:
-            orders = await self.client.rest.get_grid_algo_orders(self.config.symbol)
-            return next((o for o in orders if o.get('algoId') == self.algo_id), {})
+            try:
+                orders = await self.client.rest.get_grid_algo_orders(self.config.symbol)
+                return next((o for o in orders if o.get('algoId') == self.algo_id), {})
+            except:
+                return {}
         return {}
 
     async def run(self):
         """Run the algo bot with monitoring"""
         await self.initialize()
-        await self.start_grid_algo()
+        result = await self.start_grid_algo()
+
+        # If we fell back to custom bot, run that instead
+        if self.fallback_bot:
+            await self.fallback_bot.run()
+            return
 
         # Subscribe to grid updates
         self.client.ws.subscribe('grid_update', self._handle_grid_update)
 
         # Monitor loop
-        while True:
-            await asyncio.sleep(60)
-            status = await self.get_algo_status()
-            if status:
-                logger.info(f"Grid Algo Status: {status.get('status')}, "
-                           f"PnL: {status.get('totalPnl', 0)}")
+        try:
+            while True:
+                await asyncio.sleep(60)
+                status = await self.get_algo_status()
+                if status:
+                    logger.info(f"Grid Algo Status: {status.get('status')}, "
+                               f"PnL: {status.get('totalPnl', 0)}")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            await self.stop_grid_algo()
+            if self.client:
+                await self.client.close()
 
     async def _handle_grid_update(self, data: Dict):
         """Handle grid update events"""
