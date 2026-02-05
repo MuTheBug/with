@@ -81,17 +81,18 @@ class Position:
 @dataclass
 class LiveGridConfig:
     """Configuration for live grid trading"""
-    # Trading pair
-    symbol: str = "BTCUSDT"
+    # Trading pair - Use XRPUSDT for small accounts ($4)
+    # BTCUSDT requires $100 minimum notional
+    symbol: str = "XRPUSDT"
 
     # Grid parameters
-    num_grids: int = 10
-    grid_spacing_pct: float = 0.3
+    num_grids: int = 8
+    grid_spacing_pct: float = 0.4
     use_dynamic_spacing: bool = True
 
     # Position sizing
     total_investment: float = 4.0  # Total USDT to use
-    position_size_pct: float = 2.5  # % per grid level
+    position_size_pct: float = 3.0  # % per grid level
     max_positions: int = 6
 
     # Leverage
@@ -123,6 +124,21 @@ class LiveGridConfig:
     # Monitoring
     heartbeat_interval: int = 60  # seconds
     position_check_interval: int = 10  # seconds
+
+
+# Symbol-specific settings
+SYMBOL_CONFIG = {
+    'BTCUSDT': {'min_notional': 100, 'tick_size': 0.10, 'qty_precision': 3, 'price_precision': 2},
+    'ETHUSDT': {'min_notional': 20, 'tick_size': 0.01, 'qty_precision': 3, 'price_precision': 2},
+    'SOLUSDT': {'min_notional': 5, 'tick_size': 0.01, 'qty_precision': 0, 'price_precision': 2},
+    'XRPUSDT': {'min_notional': 5, 'tick_size': 0.0001, 'qty_precision': 1, 'price_precision': 4},
+    'DOGEUSDT': {'min_notional': 5, 'tick_size': 0.00001, 'qty_precision': 0, 'price_precision': 5},
+}
+
+
+def get_symbol_config(symbol: str) -> dict:
+    """Get symbol-specific configuration"""
+    return SYMBOL_CONFIG.get(symbol, {'min_notional': 5, 'tick_size': 0.0001, 'qty_precision': 1, 'price_precision': 4})
 
 
 class RiskManager:
@@ -271,21 +287,34 @@ class OrderManager:
                 logger.error(f"Invalid quantity: {level.quantity}")
                 return False
 
+            # Get symbol-specific configuration
+            sym_config = get_symbol_config(self.config.symbol)
+            min_notional = sym_config['min_notional']
+            tick_size = sym_config['tick_size']
+            qty_precision = sym_config['qty_precision']
+            price_precision = sym_config['price_precision']
+
             # Calculate notional value (price * quantity)
             notional = level.price * level.quantity
 
-            # Binance minimum notional is typically 5 USDT for futures
-            min_notional = 5.0
+            # Adjust quantity to meet minimum notional
             if notional < min_notional:
-                # Adjust quantity to meet minimum notional
-                level.quantity = min_notional / level.price * 1.1  # 10% buffer
-                logger.info(f"Adjusted quantity to {level.quantity:.6f} to meet min notional")
+                level.quantity = (min_notional / level.price) * 1.1  # 10% buffer
+                logger.info(f"Adjusted quantity to {level.quantity:.{qty_precision}f} to meet min notional ${min_notional}")
 
             client_order_id = f"GRID_{level.id}_{int(time.time()*1000)}"
 
-            # Round quantity based on symbol (BTC uses 3 decimals)
-            quantity = round(level.quantity, 3)
-            price = round(level.price, 2)
+            # Round to proper precision for this symbol
+            quantity = round(level.quantity, qty_precision)
+
+            # Round price to tick size
+            price = round(level.price / tick_size) * tick_size
+            price = round(price, price_precision)
+
+            # Final validation
+            if quantity <= 0:
+                logger.error(f"Quantity rounded to zero or negative: {quantity}")
+                return False
 
             order = await self.rest.place_order(
                 symbol=self.config.symbol,
