@@ -131,6 +131,30 @@ class LiveGridConfig:
     heartbeat_interval: int = 60  # seconds
     position_check_interval: int = 10  # seconds
 
+    # === NEW FEATURES ===
+
+    # Market Regime Detection
+    use_regime_detection: bool = True
+    regime_rsi_period: int = 14
+    regime_adx_period: int = 14
+    regime_bb_period: int = 20
+    regime_bb_std: float = 2.0
+    min_adx_for_trend: float = 25.0  # ADX > 25 = trending
+    rsi_oversold: float = 30.0
+    rsi_overbought: float = 70.0
+
+    # Funding Rate Optimization
+    use_funding_optimization: bool = True
+    funding_threshold: float = 0.01  # 0.01% = significant funding
+    avoid_high_funding: bool = True  # Don't hold through high funding
+
+    # Multi-Timeframe Bias
+    use_mtf_bias: bool = True
+    mtf_timeframe: str = "4h"  # Higher timeframe for bias
+    mtf_ema_fast: int = 9
+    mtf_ema_slow: int = 21
+    bias_grid_ratio: float = 0.7  # 70% grids in bias direction
+
 
 # Symbol-specific settings
 SYMBOL_CONFIG = {
@@ -145,6 +169,444 @@ SYMBOL_CONFIG = {
 def get_symbol_config(symbol: str) -> dict:
     """Get symbol-specific configuration"""
     return SYMBOL_CONFIG.get(symbol, {'min_notional': 5, 'tick_size': 0.0001, 'qty_precision': 1, 'price_precision': 4})
+
+
+# ============================================================================
+# FEATURE 1: MARKET REGIME DETECTION
+# ============================================================================
+
+class MarketRegime(Enum):
+    """Market regime types"""
+    RANGING = "RANGING"      # Sideways - IDEAL for grid trading
+    TRENDING_UP = "TRENDING_UP"    # Uptrend - bias long
+    TRENDING_DOWN = "TRENDING_DOWN"  # Downtrend - bias short
+    HIGH_VOLATILITY = "HIGH_VOLATILITY"  # Too volatile - pause trading
+    UNKNOWN = "UNKNOWN"
+
+
+class MarketRegimeDetector:
+    """
+    Detects market regime using RSI, ADX, and Bollinger Bands.
+    Grid trading works best in RANGING markets.
+    """
+
+    def __init__(self, config: LiveGridConfig):
+        self.config = config
+        self.price_history: List[float] = []
+        self.high_history: List[float] = []
+        self.low_history: List[float] = []
+        self.close_history: List[float] = []
+        self.current_regime = MarketRegime.UNKNOWN
+        self.regime_confidence = 0.0
+        self.last_rsi = 50.0
+        self.last_adx = 0.0
+        self.last_bb_width = 0.0
+
+    def update(self, open_p: float, high: float, low: float, close: float):
+        """Update with new candle data"""
+        self.price_history.append(close)
+        self.high_history.append(high)
+        self.low_history.append(low)
+        self.close_history.append(close)
+
+        # Keep limited history
+        max_len = max(self.config.regime_rsi_period, self.config.regime_adx_period,
+                      self.config.regime_bb_period) + 10
+        if len(self.price_history) > max_len:
+            self.price_history = self.price_history[-max_len:]
+            self.high_history = self.high_history[-max_len:]
+            self.low_history = self.low_history[-max_len:]
+            self.close_history = self.close_history[-max_len:]
+
+    def calculate_rsi(self, period: int = None) -> float:
+        """Calculate RSI"""
+        period = period or self.config.regime_rsi_period
+        if len(self.close_history) < period + 1:
+            return 50.0
+
+        prices = self.close_history[-(period + 1):]
+        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+
+        gains = [d if d > 0 else 0 for d in deltas]
+        losses = [-d if d < 0 else 0 for d in deltas]
+
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+
+        if avg_loss == 0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        self.last_rsi = rsi
+        return rsi
+
+    def calculate_adx(self, period: int = None) -> float:
+        """Calculate ADX (Average Directional Index)"""
+        period = period or self.config.regime_adx_period
+        if len(self.high_history) < period + 1:
+            return 0.0
+
+        highs = self.high_history[-(period + 1):]
+        lows = self.low_history[-(period + 1):]
+        closes = self.close_history[-(period + 1):]
+
+        # Calculate True Range and Directional Movement
+        tr_list = []
+        plus_dm_list = []
+        minus_dm_list = []
+
+        for i in range(1, len(highs)):
+            high_diff = highs[i] - highs[i-1]
+            low_diff = lows[i-1] - lows[i]
+
+            plus_dm = high_diff if high_diff > low_diff and high_diff > 0 else 0
+            minus_dm = low_diff if low_diff > high_diff and low_diff > 0 else 0
+
+            tr = max(highs[i] - lows[i],
+                    abs(highs[i] - closes[i-1]),
+                    abs(lows[i] - closes[i-1]))
+
+            tr_list.append(tr)
+            plus_dm_list.append(plus_dm)
+            minus_dm_list.append(minus_dm)
+
+        if not tr_list or sum(tr_list) == 0:
+            return 0.0
+
+        # Smoothed averages
+        atr = sum(tr_list) / len(tr_list)
+        plus_di = 100 * (sum(plus_dm_list) / len(plus_dm_list)) / atr if atr > 0 else 0
+        minus_di = 100 * (sum(minus_dm_list) / len(minus_dm_list)) / atr if atr > 0 else 0
+
+        # ADX
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            return 0.0
+
+        dx = 100 * abs(plus_di - minus_di) / di_sum
+        self.last_adx = dx
+        return dx
+
+    def calculate_bollinger_bands(self, period: int = None, std_dev: float = None) -> Tuple[float, float, float, float]:
+        """Calculate Bollinger Bands and width"""
+        period = period or self.config.regime_bb_period
+        std_dev = std_dev or self.config.regime_bb_std
+
+        if len(self.close_history) < period:
+            return 0, 0, 0, 0
+
+        prices = self.close_history[-period:]
+        sma = sum(prices) / len(prices)
+
+        variance = sum((p - sma) ** 2 for p in prices) / len(prices)
+        std = variance ** 0.5
+
+        upper = sma + (std_dev * std)
+        lower = sma - (std_dev * std)
+
+        # BB Width as percentage
+        bb_width = ((upper - lower) / sma) * 100 if sma > 0 else 0
+        self.last_bb_width = bb_width
+
+        return sma, upper, lower, bb_width
+
+    def detect_regime(self) -> Tuple[MarketRegime, float]:
+        """
+        Detect current market regime.
+        Returns (regime, confidence)
+        """
+        if len(self.close_history) < 20:
+            return MarketRegime.UNKNOWN, 0.0
+
+        rsi = self.calculate_rsi()
+        adx = self.calculate_adx()
+        sma, bb_upper, bb_lower, bb_width = self.calculate_bollinger_bands()
+
+        confidence = 0.0
+        regime = MarketRegime.UNKNOWN
+
+        # High volatility check (BB width > 5% is high)
+        if bb_width > 5.0:
+            regime = MarketRegime.HIGH_VOLATILITY
+            confidence = min(bb_width / 10.0, 1.0)
+
+        # Trending check (ADX > threshold)
+        elif adx > self.config.min_adx_for_trend:
+            # Determine trend direction using RSI and price position
+            current_price = self.close_history[-1]
+
+            if rsi > 50 and current_price > sma:
+                regime = MarketRegime.TRENDING_UP
+                confidence = min(adx / 50.0, 1.0)
+            elif rsi < 50 and current_price < sma:
+                regime = MarketRegime.TRENDING_DOWN
+                confidence = min(adx / 50.0, 1.0)
+            else:
+                regime = MarketRegime.RANGING
+                confidence = 0.5
+
+        # Ranging market (low ADX, tight BB)
+        else:
+            regime = MarketRegime.RANGING
+            # Higher confidence when ADX is very low and BB is tight
+            adx_score = 1 - (adx / self.config.min_adx_for_trend)
+            bb_score = 1 - min(bb_width / 5.0, 1.0)
+            confidence = (adx_score + bb_score) / 2
+
+        self.current_regime = regime
+        self.regime_confidence = confidence
+
+        return regime, confidence
+
+    def should_trade(self) -> Tuple[bool, str]:
+        """
+        Determine if we should trade based on regime.
+        Returns (should_trade, reason)
+        """
+        regime, confidence = self.detect_regime()
+
+        if regime == MarketRegime.HIGH_VOLATILITY:
+            return False, f"High volatility (BB width: {self.last_bb_width:.1f}%)"
+
+        if regime == MarketRegime.TRENDING_UP and confidence > 0.7:
+            return True, f"Uptrend detected (ADX: {self.last_adx:.1f}), bias LONG"
+
+        if regime == MarketRegime.TRENDING_DOWN and confidence > 0.7:
+            return True, f"Downtrend detected (ADX: {self.last_adx:.1f}), bias SHORT"
+
+        if regime == MarketRegime.RANGING:
+            return True, f"Ranging market - IDEAL for grid (ADX: {self.last_adx:.1f})"
+
+        return True, "Unknown regime, trading with caution"
+
+
+# ============================================================================
+# FEATURE 2: FUNDING RATE OPTIMIZATION
+# ============================================================================
+
+class FundingRateOptimizer:
+    """
+    Optimizes positions based on Binance funding rates.
+    Funding is paid/received every 8 hours.
+    """
+
+    def __init__(self, config: LiveGridConfig):
+        self.config = config
+        self.current_funding_rate = 0.0
+        self.predicted_funding_rate = 0.0
+        self.next_funding_time = 0
+        self.funding_history: List[Tuple[int, float]] = []
+
+    async def update_funding_rate(self, rest_client) -> float:
+        """Fetch current funding rate from Binance"""
+        try:
+            data = await rest_client.get_mark_price(self.config.symbol)
+            if isinstance(data, dict):
+                self.current_funding_rate = float(data.get('lastFundingRate', 0)) * 100
+                self.next_funding_time = int(data.get('nextFundingTime', 0))
+                self.predicted_funding_rate = float(data.get('interestRate', 0)) * 100
+
+                self.funding_history.append((time.time(), self.current_funding_rate))
+                # Keep last 24 hours (3 funding periods)
+                cutoff = time.time() - 86400
+                self.funding_history = [(t, r) for t, r in self.funding_history if t > cutoff]
+
+            return self.current_funding_rate
+        except Exception as e:
+            logger.warning(f"Failed to get funding rate: {e}")
+            return 0.0
+
+    def get_funding_bias(self) -> Tuple[str, float]:
+        """
+        Get position bias based on funding rate.
+        Returns (bias: 'LONG'/'SHORT'/'NEUTRAL', strength: 0-1)
+
+        Logic:
+        - Very negative funding (-0.01% or less): Shorts pay longs -> bias LONG
+        - Very positive funding (+0.01% or more): Longs pay shorts -> bias SHORT
+        - Neutral funding: No bias
+        """
+        threshold = self.config.funding_threshold
+
+        if self.current_funding_rate < -threshold:
+            # Negative funding = shorts pay longs = go long
+            strength = min(abs(self.current_funding_rate) / (threshold * 5), 1.0)
+            return 'LONG', strength
+
+        elif self.current_funding_rate > threshold:
+            # Positive funding = longs pay shorts = go short
+            strength = min(abs(self.current_funding_rate) / (threshold * 5), 1.0)
+            return 'SHORT', strength
+
+        return 'NEUTRAL', 0.0
+
+    def time_to_funding(self) -> int:
+        """Seconds until next funding"""
+        if self.next_funding_time == 0:
+            return 0
+        return max(0, int(self.next_funding_time / 1000) - int(time.time()))
+
+    def should_avoid_position(self, side: str) -> Tuple[bool, str]:
+        """
+        Check if we should avoid opening a position due to funding.
+
+        Args:
+            side: 'LONG' or 'SHORT'
+
+        Returns:
+            (should_avoid, reason)
+        """
+        if not self.config.avoid_high_funding:
+            return False, ""
+
+        threshold = self.config.funding_threshold
+        time_to_fund = self.time_to_funding()
+
+        # If funding is in next 30 minutes
+        if time_to_fund > 0 and time_to_fund < 1800:
+            # Avoid going long if we'll pay high funding
+            if side == 'LONG' and self.current_funding_rate > threshold * 2:
+                return True, f"High funding ({self.current_funding_rate:.3f}%) in {time_to_fund//60}m"
+
+            # Avoid going short if we'll pay high funding
+            if side == 'SHORT' and self.current_funding_rate < -threshold * 2:
+                return True, f"Negative funding ({self.current_funding_rate:.3f}%) in {time_to_fund//60}m"
+
+        return False, ""
+
+    def get_funding_summary(self) -> str:
+        """Get funding rate summary string"""
+        bias, strength = self.get_funding_bias()
+        time_to_fund = self.time_to_funding()
+        return (f"Funding: {self.current_funding_rate:.4f}% | "
+                f"Bias: {bias} ({strength:.0%}) | "
+                f"Next in: {time_to_fund//60}m")
+
+
+# ============================================================================
+# FEATURE 3: MULTI-TIMEFRAME BIAS
+# ============================================================================
+
+class MultiTimeframeBias:
+    """
+    Determines grid direction bias using higher timeframe analysis.
+    Uses EMA crossover on higher timeframe to determine trend.
+    """
+
+    def __init__(self, config: LiveGridConfig):
+        self.config = config
+        self.htf_candles: List[Dict] = []  # Higher timeframe candles
+        self.current_bias = 'NEUTRAL'  # 'LONG', 'SHORT', 'NEUTRAL'
+        self.bias_strength = 0.0
+        self.last_update = 0
+        self.ema_fast = 0.0
+        self.ema_slow = 0.0
+
+    async def update_candles(self, rest_client) -> bool:
+        """Fetch higher timeframe candles"""
+        try:
+            # Only update every 5 minutes to avoid rate limits
+            if time.time() - self.last_update < 300:
+                return True
+
+            klines = await rest_client.get_klines(
+                self.config.symbol,
+                self.config.mtf_timeframe,
+                limit=50
+            )
+
+            self.htf_candles = [
+                {
+                    'open': float(k[1]),
+                    'high': float(k[2]),
+                    'low': float(k[3]),
+                    'close': float(k[4]),
+                    'volume': float(k[5])
+                }
+                for k in klines
+            ]
+
+            self.last_update = time.time()
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch HTF candles: {e}")
+            return False
+
+    def calculate_ema(self, prices: List[float], period: int) -> float:
+        """Calculate EMA"""
+        if len(prices) < period:
+            return prices[-1] if prices else 0
+
+        multiplier = 2 / (period + 1)
+        ema = prices[0]
+
+        for price in prices[1:]:
+            ema = (price * multiplier) + (ema * (1 - multiplier))
+
+        return ema
+
+    def detect_bias(self) -> Tuple[str, float]:
+        """
+        Detect bias from higher timeframe.
+        Returns (bias: 'LONG'/'SHORT'/'NEUTRAL', strength: 0-1)
+        """
+        if len(self.htf_candles) < self.config.mtf_ema_slow + 5:
+            return 'NEUTRAL', 0.0
+
+        closes = [c['close'] for c in self.htf_candles]
+
+        self.ema_fast = self.calculate_ema(closes, self.config.mtf_ema_fast)
+        self.ema_slow = self.calculate_ema(closes, self.config.mtf_ema_slow)
+
+        current_price = closes[-1]
+
+        # Calculate bias
+        ema_diff_pct = (self.ema_fast - self.ema_slow) / self.ema_slow * 100
+
+        if ema_diff_pct > 0.1:  # Fast EMA above slow = bullish
+            self.current_bias = 'LONG'
+            self.bias_strength = min(abs(ema_diff_pct) / 1.0, 1.0)  # Normalize to 0-1
+        elif ema_diff_pct < -0.1:  # Fast EMA below slow = bearish
+            self.current_bias = 'SHORT'
+            self.bias_strength = min(abs(ema_diff_pct) / 1.0, 1.0)
+        else:
+            self.current_bias = 'NEUTRAL'
+            self.bias_strength = 0.0
+
+        return self.current_bias, self.bias_strength
+
+    def get_grid_distribution(self, total_grids: int) -> Tuple[int, int]:
+        """
+        Get number of buy vs sell grids based on bias.
+        Returns (num_buy_grids, num_sell_grids)
+        """
+        if not self.config.use_mtf_bias:
+            return total_grids, total_grids
+
+        bias, strength = self.detect_bias()
+
+        if bias == 'NEUTRAL' or strength < 0.3:
+            return total_grids, total_grids
+
+        # Apply bias ratio
+        ratio = self.config.bias_grid_ratio
+        biased_grids = int(total_grids * ratio)
+        reduced_grids = total_grids - biased_grids + total_grids // 2
+
+        if bias == 'LONG':
+            # More buy grids, fewer sell grids
+            return biased_grids, reduced_grids
+        else:
+            # More sell grids, fewer buy grids
+            return reduced_grids, biased_grids
+
+    def get_bias_summary(self) -> str:
+        """Get bias summary string"""
+        return (f"MTF Bias: {self.current_bias} ({self.bias_strength:.0%}) | "
+                f"EMA{self.config.mtf_ema_fast}: {self.ema_fast:.4f} | "
+                f"EMA{self.config.mtf_ema_slow}: {self.ema_slow:.4f}")
 
 
 class RiskManager:
@@ -573,6 +1035,11 @@ class LiveGridBot:
         self.order_manager: Optional[OrderManager] = None
         self.risk_manager = RiskManager(config)
 
+        # NEW FEATURES
+        self.regime_detector = MarketRegimeDetector(config)
+        self.funding_optimizer = FundingRateOptimizer(config)
+        self.mtf_bias = MultiTimeframeBias(config)
+
         # State
         self.is_running = False
         self.is_initialized = False
@@ -580,6 +1047,8 @@ class LiveGridBot:
         self.grid_center = 0.0
         self.grid_levels: List[GridLevel] = []
         self.positions: List[Position] = []
+        self.trading_paused = False
+        self.pause_reason = ""
 
         # Statistics
         self.start_time: Optional[datetime] = None
@@ -624,13 +1093,55 @@ class LiveGridBot:
         # Get current price
         ticker = await self.client.rest.get_ticker_price(self.config.symbol)
         self.current_price = float(ticker['price'])
-        logger.info(f"Current {self.config.symbol} price: ${self.current_price:.2f}")
+        logger.info(f"Current {self.config.symbol} price: ${self.current_price:.4f}")
+
+        # Initialize new features
+        await self._initialize_features()
 
         self.is_initialized = True
         logger.info("Bot initialized successfully")
 
+    async def _initialize_features(self):
+        """Initialize market analysis features"""
+        logger.info("Initializing market analysis features...")
+
+        # 1. Load historical candles for regime detection
+        if self.config.use_regime_detection:
+            try:
+                klines = await self.client.rest.get_klines(
+                    self.config.symbol, "15m", limit=50
+                )
+                for k in klines:
+                    self.regime_detector.update(
+                        float(k[1]), float(k[2]), float(k[3]), float(k[4])
+                    )
+                regime, confidence = self.regime_detector.detect_regime()
+                logger.info(f"Market Regime: {regime.value} (confidence: {confidence:.0%})")
+                logger.info(f"  RSI: {self.regime_detector.last_rsi:.1f}, "
+                           f"ADX: {self.regime_detector.last_adx:.1f}, "
+                           f"BB Width: {self.regime_detector.last_bb_width:.2f}%")
+            except Exception as e:
+                logger.warning(f"Failed to initialize regime detector: {e}")
+
+        # 2. Get funding rate
+        if self.config.use_funding_optimization:
+            try:
+                await self.funding_optimizer.update_funding_rate(self.client.rest)
+                logger.info(self.funding_optimizer.get_funding_summary())
+            except Exception as e:
+                logger.warning(f"Failed to get funding rate: {e}")
+
+        # 3. Get MTF bias
+        if self.config.use_mtf_bias:
+            try:
+                await self.mtf_bias.update_candles(self.client.rest)
+                bias, strength = self.mtf_bias.detect_bias()
+                logger.info(self.mtf_bias.get_bias_summary())
+            except Exception as e:
+                logger.warning(f"Failed to get MTF bias: {e}")
+
     async def setup_grid(self):
-        """Setup initial grid orders"""
+        """Setup initial grid orders with smart features"""
         logger.info("Setting up grid...")
 
         # Cancel any existing orders
@@ -640,6 +1151,31 @@ class LiveGridBot:
         if self.current_price <= 0:
             logger.error("Invalid current price, cannot setup grid")
             return False
+
+        # ===== FEATURE 1: CHECK MARKET REGIME =====
+        if self.config.use_regime_detection:
+            should_trade, reason = self.regime_detector.should_trade()
+            regime = self.regime_detector.current_regime
+
+            if not should_trade:
+                logger.warning(f"Trading paused: {reason}")
+                self.trading_paused = True
+                self.pause_reason = reason
+                return False
+
+            logger.info(f"Regime check passed: {reason}")
+
+        # ===== FEATURE 2: UPDATE FUNDING RATE =====
+        if self.config.use_funding_optimization:
+            await self.funding_optimizer.update_funding_rate(self.client.rest)
+            funding_bias, funding_strength = self.funding_optimizer.get_funding_bias()
+            logger.info(f"Funding bias: {funding_bias} ({funding_strength:.0%})")
+
+        # ===== FEATURE 3: GET MTF BIAS =====
+        if self.config.use_mtf_bias:
+            await self.mtf_bias.update_candles(self.client.rest)
+            mtf_bias, mtf_strength = self.mtf_bias.detect_bias()
+            logger.info(f"MTF bias: {mtf_bias} ({mtf_strength:.0%})")
 
         # Set grid center to current price
         self.grid_center = self.current_price
@@ -670,8 +1206,54 @@ class LiveGridBot:
 
         logger.info(f"Position size per grid: {position_size:.6f}")
 
+        # ===== DETERMINE GRID DISTRIBUTION BASED ON BIAS =====
+        num_buy_grids = self.config.num_grids
+        num_sell_grids = self.config.num_grids
+
+        # Combine biases: MTF bias + Funding bias + Regime bias
+        combined_bias = 'NEUTRAL'
+        bias_score = 0  # Positive = LONG, Negative = SHORT
+
+        if self.config.use_mtf_bias:
+            mtf_bias, mtf_strength = self.mtf_bias.detect_bias()
+            if mtf_bias == 'LONG':
+                bias_score += mtf_strength * 2  # MTF has higher weight
+            elif mtf_bias == 'SHORT':
+                bias_score -= mtf_strength * 2
+
+        if self.config.use_funding_optimization:
+            funding_bias, funding_strength = self.funding_optimizer.get_funding_bias()
+            if funding_bias == 'LONG':
+                bias_score += funding_strength
+            elif funding_bias == 'SHORT':
+                bias_score -= funding_strength
+
+        if self.config.use_regime_detection:
+            regime = self.regime_detector.current_regime
+            if regime == MarketRegime.TRENDING_UP:
+                bias_score += 0.5
+            elif regime == MarketRegime.TRENDING_DOWN:
+                bias_score -= 0.5
+
+        # Apply combined bias to grid distribution
+        if bias_score > 0.5:
+            combined_bias = 'LONG'
+            # More buy grids, fewer sell grids
+            buy_ratio = min(0.8, 0.5 + bias_score * 0.15)
+            num_buy_grids = int(self.config.num_grids * buy_ratio / 0.5)
+            num_sell_grids = max(2, self.config.num_grids - (num_buy_grids - self.config.num_grids))
+        elif bias_score < -0.5:
+            combined_bias = 'SHORT'
+            # More sell grids, fewer buy grids
+            sell_ratio = min(0.8, 0.5 + abs(bias_score) * 0.15)
+            num_sell_grids = int(self.config.num_grids * sell_ratio / 0.5)
+            num_buy_grids = max(2, self.config.num_grids - (num_sell_grids - self.config.num_grids))
+
+        logger.info(f"Combined bias: {combined_bias} (score: {bias_score:.2f})")
+        logger.info(f"Grid distribution: {num_buy_grids} BUY / {num_sell_grids} SELL")
+
         # Create buy levels (below current price)
-        for i in range(1, self.config.num_grids + 1):
+        for i in range(1, num_buy_grids + 1):
             price = self.grid_center * (1 - spacing * i / 100)
             if price > 0:  # Only add valid prices
                 self.grid_levels.append(GridLevel(
@@ -685,7 +1267,7 @@ class LiveGridBot:
                 logger.warning(f"Skipping invalid buy price: {price}")
 
         # Create sell levels (above current price)
-        for i in range(1, self.config.num_grids + 1):
+        for i in range(1, num_sell_grids + 1):
             price = self.grid_center * (1 + spacing * i / 100)
             self.grid_levels.append(GridLevel(
                 id=f"S{grid_id}",
@@ -696,11 +1278,14 @@ class LiveGridBot:
             grid_id += 1
 
         logger.info(f"Created {len(self.grid_levels)} grid levels")
-        logger.info(f"Price range: ${min(l.price for l in self.grid_levels):.2f} - ${max(l.price for l in self.grid_levels):.2f}")
+        logger.info(f"Price range: ${min(l.price for l in self.grid_levels):.4f} - ${max(l.price for l in self.grid_levels):.4f}")
 
         # Place all orders
         success_count = await self.order_manager.place_all_grid_orders(self.grid_levels)
         logger.info(f"Placed {success_count}/{len(self.grid_levels)} grid orders")
+
+        self.trading_paused = False
+        self.pause_reason = ""
 
         return success_count > 0
 
@@ -898,13 +1483,17 @@ class LiveGridBot:
         self.is_running = True
         self.start_time = datetime.now()
 
-        logger.info("="*50)
-        logger.info("  GRID BOT STARTED")
+        logger.info("="*60)
+        logger.info("  SMART GRID BOT STARTED")
         logger.info(f"  Symbol: {self.config.symbol}")
         logger.info(f"  Leverage: {self.config.leverage}x")
         logger.info(f"  Grids: {self.config.num_grids} each side")
         logger.info(f"  Spacing: {self.config.grid_spacing_pct}%")
-        logger.info("="*50)
+        logger.info("  Features enabled:")
+        logger.info(f"    - Market Regime Detection: {self.config.use_regime_detection}")
+        logger.info(f"    - Funding Optimization: {self.config.use_funding_optimization}")
+        logger.info(f"    - Multi-TF Bias: {self.config.use_mtf_bias}")
+        logger.info("="*60)
 
         # Setup initial grid
         await self.setup_grid()
@@ -927,7 +1516,8 @@ class LiveGridBot:
             self.client.ws.connect_user_stream(),
             self._position_monitor_loop(),
             self._heartbeat_loop(),
-            self._status_loop()
+            self._status_loop(),
+            self._feature_analysis_loop()  # NEW: Periodic feature analysis
         )
 
     async def _position_monitor_loop(self):
@@ -936,16 +1526,80 @@ class LiveGridBot:
             await asyncio.sleep(self.config.position_check_interval)
             await self.check_positions()
 
+    async def _feature_analysis_loop(self):
+        """Periodically update market analysis features"""
+        while self.is_running:
+            await asyncio.sleep(300)  # Every 5 minutes
+
+            try:
+                # Update regime detection with recent candles
+                if self.config.use_regime_detection:
+                    klines = await self.client.rest.get_klines(
+                        self.config.symbol, "15m", limit=5
+                    )
+                    for k in klines[-3:]:  # Only last 3 candles
+                        self.regime_detector.update(
+                            float(k[1]), float(k[2]), float(k[3]), float(k[4])
+                        )
+
+                    should_trade, reason = self.regime_detector.should_trade()
+                    if not should_trade and not self.trading_paused:
+                        logger.warning(f"Market regime changed: {reason}")
+                        self.trading_paused = True
+                        self.pause_reason = reason
+                    elif should_trade and self.trading_paused:
+                        logger.info(f"Market regime favorable again: {reason}")
+                        self.trading_paused = False
+                        self.pause_reason = ""
+                        # Rebuild grid with new conditions
+                        await self.setup_grid()
+
+                # Update funding rate
+                if self.config.use_funding_optimization:
+                    await self.funding_optimizer.update_funding_rate(self.client.rest)
+
+                # Update MTF bias
+                if self.config.use_mtf_bias:
+                    await self.mtf_bias.update_candles(self.client.rest)
+
+            except Exception as e:
+                logger.warning(f"Feature analysis error: {e}")
+
     async def _heartbeat_loop(self):
-        """Heartbeat for monitoring"""
+        """Heartbeat for monitoring with feature info"""
         while self.is_running:
             await asyncio.sleep(self.config.heartbeat_interval)
-            logger.info(f"Heartbeat - Price: ${self.current_price:.2f}, "
-                       f"Balance: ${self.risk_manager.current_balance:.2f}, "
-                       f"DD: {self.risk_manager.current_drawdown:.2f}%")
+
+            # Build status message
+            status_parts = [
+                f"Price: ${self.current_price:.4f}",
+                f"Bal: ${self.risk_manager.current_balance:.2f}",
+                f"DD: {self.risk_manager.current_drawdown:.2f}%"
+            ]
+
+            # Add regime info
+            if self.config.use_regime_detection:
+                regime = self.regime_detector.current_regime.value[:4]
+                status_parts.append(f"Regime: {regime}")
+
+            # Add funding info
+            if self.config.use_funding_optimization:
+                funding = self.funding_optimizer.current_funding_rate
+                status_parts.append(f"Fund: {funding:.3f}%")
+
+            # Add bias info
+            if self.config.use_mtf_bias:
+                bias = self.mtf_bias.current_bias[:1]  # L/S/N
+                status_parts.append(f"Bias: {bias}")
+
+            # Add paused status if applicable
+            if self.trading_paused:
+                status_parts.append(f"PAUSED: {self.pause_reason[:20]}")
+
+            logger.info("Heartbeat - " + " | ".join(status_parts))
 
     async def _status_loop(self):
-        """Print status periodically"""
+        """Print detailed status periodically"""
         while self.is_running:
             await asyncio.sleep(300)  # Every 5 minutes
             await self.print_status()
