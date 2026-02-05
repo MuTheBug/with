@@ -225,6 +225,9 @@ class RiskManager:
 
     def calculate_position_size(self, price: float) -> float:
         """Calculate position size based on risk parameters"""
+        if self.current_balance <= 0 or price <= 0:
+            return 0.0
+
         base_size = (self.current_balance * self.config.position_size_pct / 100)
         leveraged_value = base_size * self.config.leverage
         quantity = leveraged_value / price
@@ -233,7 +236,13 @@ class RiskManager:
         if self.current_drawdown > self.config.max_drawdown_pct / 2:
             quantity *= 0.5
 
-        return quantity
+        # Binance minimum quantity checks (approximate)
+        # BTC: 0.001, ETH: 0.001, most others: varies
+        min_qty = 0.001
+        if quantity < min_qty:
+            quantity = min_qty
+
+        return max(0.001, quantity)
 
     def reset_daily_stats(self):
         """Reset daily statistics (call at start of new day)"""
@@ -253,14 +262,37 @@ class OrderManager:
     async def place_grid_order(self, level: GridLevel) -> bool:
         """Place a single grid order"""
         try:
+            # Validate inputs
+            if level.price <= 0:
+                logger.error(f"Invalid price: {level.price}")
+                return False
+
+            if level.quantity <= 0:
+                logger.error(f"Invalid quantity: {level.quantity}")
+                return False
+
+            # Calculate notional value (price * quantity)
+            notional = level.price * level.quantity
+
+            # Binance minimum notional is typically 5 USDT for futures
+            min_notional = 5.0
+            if notional < min_notional:
+                # Adjust quantity to meet minimum notional
+                level.quantity = min_notional / level.price * 1.1  # 10% buffer
+                logger.info(f"Adjusted quantity to {level.quantity:.6f} to meet min notional")
+
             client_order_id = f"GRID_{level.id}_{int(time.time()*1000)}"
+
+            # Round quantity based on symbol (BTC uses 3 decimals)
+            quantity = round(level.quantity, 3)
+            price = round(level.price, 2)
 
             order = await self.rest.place_order(
                 symbol=self.config.symbol,
                 side=OrderSide.BUY if level.side == 'BUY' else OrderSide.SELL,
                 order_type=OrderType.LIMIT,
-                quantity=round(level.quantity, 3),
-                price=round(level.price, 2),
+                quantity=quantity,
+                price=price,
                 time_in_force=TimeInForce.GTC,
                 client_order_id=client_order_id
             )
@@ -270,7 +302,7 @@ class OrderManager:
             level.status = GridOrderStatus.ACTIVE
             self.active_orders[client_order_id] = level
 
-            logger.info(f"Placed {level.side} order at {level.price}: {order['orderId']}")
+            logger.info(f"Placed {level.side} order: {quantity} @ ${price} (ID: {order['orderId']})")
             return True
 
         except Exception as e:
@@ -477,6 +509,11 @@ class LiveGridBot:
         # Cancel any existing orders
         await self.order_manager.cancel_all_orders()
 
+        # Validate current price
+        if self.current_price <= 0:
+            logger.error("Invalid current price, cannot setup grid")
+            return False
+
         # Set grid center to current price
         self.grid_center = self.current_price
 
@@ -484,26 +521,41 @@ class LiveGridBot:
         self.grid_levels = []
         grid_id = 0
 
-        # Calculate spacing
+        # Calculate spacing (ensure it's reasonable)
         if self.config.use_dynamic_spacing:
             volatility = self.risk_manager.calculate_volatility()
             spacing = max(self.config.grid_spacing_pct, volatility * 0.5)
         else:
             spacing = self.config.grid_spacing_pct
 
+        # Cap spacing to prevent negative prices
+        max_spacing = 90.0 / self.config.num_grids  # Max 90% total range
+        spacing = min(spacing, max_spacing)
+
+        logger.info(f"Grid spacing: {spacing:.3f}%")
+
         # Calculate position size
         position_size = self.risk_manager.calculate_position_size(self.current_price)
+
+        if position_size <= 0:
+            logger.error(f"Invalid position size: {position_size}, balance: {self.risk_manager.current_balance}")
+            return False
+
+        logger.info(f"Position size per grid: {position_size:.6f}")
 
         # Create buy levels (below current price)
         for i in range(1, self.config.num_grids + 1):
             price = self.grid_center * (1 - spacing * i / 100)
-            self.grid_levels.append(GridLevel(
-                id=f"B{grid_id}",
-                price=price,
-                side='BUY',
-                quantity=position_size
-            ))
-            grid_id += 1
+            if price > 0:  # Only add valid prices
+                self.grid_levels.append(GridLevel(
+                    id=f"B{grid_id}",
+                    price=price,
+                    side='BUY',
+                    quantity=position_size
+                ))
+                grid_id += 1
+            else:
+                logger.warning(f"Skipping invalid buy price: {price}")
 
         # Create sell levels (above current price)
         for i in range(1, self.config.num_grids + 1):
@@ -515,6 +567,9 @@ class LiveGridBot:
                 quantity=position_size
             ))
             grid_id += 1
+
+        logger.info(f"Created {len(self.grid_levels)} grid levels")
+        logger.info(f"Price range: ${min(l.price for l in self.grid_levels):.2f} - ${max(l.price for l in self.grid_levels):.2f}")
 
         # Place all orders
         success_count = await self.order_manager.place_all_grid_orders(self.grid_levels)
