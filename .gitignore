@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+bot_state.json
+trading_bot.log
