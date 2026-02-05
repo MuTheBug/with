@@ -86,41 +86,46 @@ class LiveGridConfig:
     # BTCUSDT requires $100 minimum notional
     symbol: str = "XRPUSDT"
 
-    # Grid parameters
-    num_grids: int = 8
-    grid_spacing_pct: float = 0.4
+    # Grid parameters - Conservative settings
+    num_grids: int = 5  # Reduced from 8 for less exposure
+    grid_spacing_pct: float = 0.5  # Slightly wider spacing
     use_dynamic_spacing: bool = True
 
     # Position sizing
     total_investment: float = 4.0  # Total USDT to use
-    position_size_pct: float = 3.0  # % per grid level
-    max_positions: int = 6
+    position_size_pct: float = 4.0  # % per grid level
+    max_positions: int = 4
 
-    # Leverage
-    leverage: int = 20
-    max_leverage: int = 50
+    # Leverage - Moderate
+    leverage: int = 15  # Reduced from 20 for safety
+    max_leverage: int = 25
 
-    # Risk management
-    max_drawdown_pct: float = 10.0
-    position_stop_loss_pct: float = 3.0
-    take_profit_pct: float = 0.5
+    # Risk management - Conservative
+    max_drawdown_pct: float = 6.0  # Reduced from 10%
+    position_stop_loss_pct: float = 2.0  # Tighter stop
+    take_profit_pct: float = 0.4
     use_trailing_stop: bool = True
-    trailing_stop_pct: float = 0.3
+    trailing_stop_pct: float = 0.25
 
     # Grid management
-    rebalance_threshold_pct: float = 5.0
-    max_one_sided_fills: int = 4
+    rebalance_threshold_pct: float = 4.0  # Rebalance sooner
+    max_one_sided_fills: int = 3
 
     # Execution
     order_type: str = "LIMIT"  # LIMIT or MARKET
     time_in_force: str = "GTC"
     reduce_only_exits: bool = True
 
+    # Order book settings
+    check_orderbook: bool = True  # Check liquidity before orders
+    min_orderbook_depth: float = 50.0  # Minimum $ depth required
+    max_slippage_pct: float = 0.1  # Max allowed slippage
+
     # Safety
-    emergency_stop_loss_pct: float = 15.0
-    max_daily_loss_pct: float = 8.0
+    emergency_stop_loss_pct: float = 10.0
+    max_daily_loss_pct: float = 5.0
     pause_on_high_volatility: bool = True
-    high_volatility_threshold: float = 5.0  # 5% in 1 hour
+    high_volatility_threshold: float = 4.0  # Reduced threshold
 
     # Monitoring
     heartbeat_interval: int = 60  # seconds
@@ -275,6 +280,66 @@ class OrderManager:
         self.config = config
         self.active_orders: Dict[str, GridLevel] = {}
         self.order_history: List[Dict] = []
+        self.orderbook_cache: Dict = {}
+        self.orderbook_cache_time: float = 0
+
+    async def check_orderbook_depth(self, price: float, side: str, quantity: float) -> Tuple[bool, float]:
+        """
+        Check order book depth at target price level.
+        Returns (is_sufficient, estimated_slippage_pct)
+        """
+        try:
+            # Cache orderbook for 5 seconds to avoid rate limits
+            if time.time() - self.orderbook_cache_time > 5:
+                self.orderbook_cache = await self.rest.get_orderbook(self.config.symbol, limit=20)
+                self.orderbook_cache_time = time.time()
+
+            orderbook = self.orderbook_cache
+            if not orderbook:
+                return True, 0.0  # Skip check if no data
+
+            # For BUY orders, check asks (we buy from sellers)
+            # For SELL orders, check bids (we sell to buyers)
+            if side == 'BUY':
+                levels = orderbook.get('asks', [])
+            else:
+                levels = orderbook.get('bids', [])
+
+            if not levels:
+                return True, 0.0
+
+            # Calculate depth at our price level
+            total_depth = 0.0
+            best_price = float(levels[0][0])
+
+            for level_price, level_qty in levels:
+                level_price = float(level_price)
+                level_qty = float(level_qty)
+
+                # For buys, count asks at or below our price
+                # For sells, count bids at or above our price
+                if side == 'BUY' and level_price <= price:
+                    total_depth += level_price * level_qty
+                elif side == 'SELL' and level_price >= price:
+                    total_depth += level_price * level_qty
+
+            # Calculate potential slippage
+            order_value = price * quantity
+            if total_depth > 0:
+                slippage_pct = abs(price - best_price) / best_price * 100
+            else:
+                slippage_pct = 0.0
+
+            is_sufficient = total_depth >= self.config.min_orderbook_depth
+
+            if not is_sufficient:
+                logger.warning(f"Low liquidity at ${price:.4f}: ${total_depth:.2f} depth (need ${self.config.min_orderbook_depth})")
+
+            return is_sufficient, slippage_pct
+
+        except Exception as e:
+            logger.warning(f"Orderbook check failed: {e}")
+            return True, 0.0  # Allow order on error
 
     async def place_grid_order(self, level: GridLevel) -> bool:
         """Place a single grid order"""
@@ -316,6 +381,16 @@ class OrderManager:
             if quantity <= 0:
                 logger.error(f"Quantity rounded to zero or negative: {quantity}")
                 return False
+
+            # Check order book depth before placing order
+            if self.config.check_orderbook:
+                is_liquid, slippage = await self.check_orderbook_depth(price, level.side, quantity)
+                if not is_liquid:
+                    logger.warning(f"Skipping {level.side} order at ${price:.4f} due to low liquidity")
+                    return False
+                if slippage > self.config.max_slippage_pct:
+                    logger.warning(f"Skipping {level.side} order at ${price:.4f} due to high slippage ({slippage:.2f}%)")
+                    return False
 
             order = await self.rest.place_order(
                 symbol=self.config.symbol,
@@ -1049,13 +1124,15 @@ def load_config_from_env() -> Tuple[LiveGridConfig, BinanceConfig]:
         testnet=os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'
     )
 
+    # Moderate/conservative defaults
     live_config = LiveGridConfig(
-        symbol=os.getenv('TRADING_SYMBOL', 'BTCUSDT'),
-        num_grids=int(os.getenv('NUM_GRIDS', '10')),
-        grid_spacing_pct=float(os.getenv('GRID_SPACING', '0.3')),
+        symbol=os.getenv('TRADING_SYMBOL', 'XRPUSDT'),  # XRP for small accounts
+        num_grids=int(os.getenv('NUM_GRIDS', '5')),  # 5 grids each side
+        grid_spacing_pct=float(os.getenv('GRID_SPACING', '0.5')),
         total_investment=float(os.getenv('TOTAL_INVESTMENT', '4.0')),
-        leverage=int(os.getenv('LEVERAGE', '20')),
-        max_drawdown_pct=float(os.getenv('MAX_DRAWDOWN', '10.0')),
+        leverage=int(os.getenv('LEVERAGE', '15')),  # Moderate 15x
+        max_drawdown_pct=float(os.getenv('MAX_DRAWDOWN', '6.0')),  # 6% max DD
+        check_orderbook=os.getenv('CHECK_ORDERBOOK', 'true').lower() == 'true',
     )
 
     return live_config, binance_config
