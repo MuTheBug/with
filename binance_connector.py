@@ -340,102 +340,162 @@ class BinanceFuturesREST:
         }, signed=True)
 
     # ==================== Algo Trading Endpoints ====================
+    # Note: Binance Algo API is for CONDITIONAL orders (TP/SL/Trailing)
+    # NOT for grid trading automation - use custom implementation for grids
 
     async def place_algo_order(
         self,
         symbol: str,
         side: OrderSide,
+        order_type: str,  # 'STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'TRAILING_STOP_MARKET'
         quantity: float,
-        algo_type: str,  # 'VP' (Volume Participation), 'TWAP', etc.
-        duration: int,  # Duration in seconds
+        trigger_price: float,
+        price: float = None,  # Required for STOP, TAKE_PROFIT (limit orders)
+        callback_rate: float = None,  # For TRAILING_STOP_MARKET (e.g., 1.0 = 1%)
+        activate_price: float = None,  # For TRAILING_STOP_MARKET
+        working_type: str = "CONTRACT_PRICE",  # 'MARK_PRICE' or 'CONTRACT_PRICE'
+        position_side: PositionSide = PositionSide.BOTH,
+        reduce_only: bool = False,
+        close_position: bool = False,
+        price_protect: bool = False,
+        client_algo_id: str = None,
         **kwargs
     ) -> Dict:
-        """Place algorithmic order using Algo API"""
+        """
+        Place algorithmic conditional order using Binance Algo API
+
+        Supported order types:
+        - STOP: Stop limit order (requires price)
+        - STOP_MARKET: Stop market order
+        - TAKE_PROFIT: Take profit limit order (requires price)
+        - TAKE_PROFIT_MARKET: Take profit market order
+        - TRAILING_STOP_MARKET: Trailing stop (requires callbackRate)
+        """
         params = {
             'symbol': symbol,
             'side': side.value,
+            'type': order_type,
+            'algoType': 'CONDITIONAL',
             'quantity': quantity,
-            'algoType': algo_type,
-            'duration': duration,
-            **kwargs
+            'triggerPrice': trigger_price,
+            'workingType': working_type,
+            'positionSide': position_side.value,
         }
-        return await self._request("POST", "/fapi/v1/algo/order", params, signed=True)
 
-    async def cancel_algo_order(self, algo_id: int) -> Dict:
+        # Price required for limit orders
+        if price and order_type in ['STOP', 'TAKE_PROFIT']:
+            params['price'] = price
+            params['timeInForce'] = 'GTC'
+
+        # Trailing stop parameters
+        if order_type == 'TRAILING_STOP_MARKET':
+            if callback_rate:
+                params['callbackRate'] = callback_rate
+            if activate_price:
+                params['activatePrice'] = activate_price
+
+        if reduce_only:
+            params['reduceOnly'] = 'true'
+
+        if close_position:
+            params['closePosition'] = 'true'
+            if 'quantity' in params:
+                del params['quantity']  # Cannot use quantity with closePosition
+
+        if price_protect:
+            params['priceProtect'] = 'TRUE'
+
+        if client_algo_id:
+            params['clientAlgoId'] = client_algo_id
+
+        params.update(kwargs)
+
+        return await self._request("POST", "/fapi/v1/algoOrder", params, signed=True)
+
+    async def cancel_algo_order(self, symbol: str, algo_id: int = None,
+                                client_algo_id: str = None) -> Dict:
         """Cancel an algo order"""
-        return await self._request("DELETE", "/fapi/v1/algo/order", {
-            'algoId': algo_id
-        }, signed=True)
+        params = {'symbol': symbol}
+        if algo_id:
+            params['algoId'] = algo_id
+        if client_algo_id:
+            params['clientAlgoId'] = client_algo_id
+        return await self._request("DELETE", "/fapi/v1/algoOrder", params, signed=True)
 
-    async def get_algo_orders(self, symbol: str = None,
-                              algo_id: int = None) -> List[Dict]:
-        """Get algo order history"""
+    async def get_algo_open_orders(self, symbol: str = None) -> List[Dict]:
+        """Get open algo orders"""
         params = {}
+        if symbol:
+            params['symbol'] = symbol
+        return await self._request("GET", "/fapi/v1/algoOrder/openOrders", params, signed=True)
+
+    async def get_algo_order_history(self, symbol: str = None,
+                                     algo_id: int = None,
+                                     start_time: int = None,
+                                     end_time: int = None,
+                                     limit: int = 100) -> List[Dict]:
+        """Get algo order history"""
+        params = {'limit': limit}
         if symbol:
             params['symbol'] = symbol
         if algo_id:
             params['algoId'] = algo_id
-        return await self._request("GET", "/fapi/v1/algo/openOrders", params, signed=True)
-
-    # ==================== Grid Trading Algo Endpoints ====================
-
-    async def place_grid_algo(
-        self,
-        symbol: str,
-        side: str,  # 'NEUTRAL', 'LONG', 'SHORT'
-        quantity: float,
-        grid_count: int,
-        price_upper: float,
-        price_lower: float,
-        **kwargs
-    ) -> Dict:
-        """
-        Place grid trading algo order
-        Uses Binance's native grid trading API
-        """
-        params = {
-            'symbol': symbol,
-            'side': side,
-            'quantity': quantity,
-            'gridCount': grid_count,
-            'priceUpper': price_upper,
-            'priceLower': price_lower,
-            **kwargs
-        }
-        return await self._request("POST", "/fapi/v1/algo/futures/grid", params, signed=True)
-
-    async def modify_grid_algo(self, algo_id: int, **kwargs) -> Dict:
-        """Modify grid trading algo parameters"""
-        params = {'algoId': algo_id, **kwargs}
-        return await self._request("PUT", "/fapi/v1/algo/futures/grid", params, signed=True)
-
-    async def cancel_grid_algo(self, algo_id: int) -> Dict:
-        """Cancel grid trading algo"""
-        return await self._request("DELETE", "/fapi/v1/algo/futures/grid", {
-            'algoId': algo_id
-        }, signed=True)
-
-    async def get_grid_algo_orders(self, symbol: str = None) -> List[Dict]:
-        """Get grid algo orders"""
-        params = {}
-        if symbol:
-            params['symbol'] = symbol
-        return await self._request("GET", "/fapi/v1/algo/futures/grid/openOrders",
-                                   params, signed=True)
-
-    async def get_grid_algo_history(self, symbol: str = None,
-                                    start_time: int = None,
-                                    end_time: int = None) -> List[Dict]:
-        """Get grid algo order history"""
-        params = {}
-        if symbol:
-            params['symbol'] = symbol
         if start_time:
             params['startTime'] = start_time
         if end_time:
             params['endTime'] = end_time
-        return await self._request("GET", "/fapi/v1/algo/futures/grid/historyOrders",
-                                   params, signed=True)
+        return await self._request("GET", "/fapi/v1/algoOrder/historyOrders", params, signed=True)
+
+    # ==================== Helper Methods for Grid Trading ====================
+    # Grid trading uses regular limit orders, not the Algo API
+
+    async def place_stop_loss_algo(self, symbol: str, side: OrderSide,
+                                   quantity: float, trigger_price: float,
+                                   reduce_only: bool = True) -> Dict:
+        """Place stop loss using Algo API"""
+        return await self.place_algo_order(
+            symbol=symbol,
+            side=side,
+            order_type='STOP_MARKET',
+            quantity=quantity,
+            trigger_price=trigger_price,
+            reduce_only=reduce_only
+        )
+
+    async def place_take_profit_algo(self, symbol: str, side: OrderSide,
+                                     quantity: float, trigger_price: float,
+                                     reduce_only: bool = True) -> Dict:
+        """Place take profit using Algo API"""
+        return await self.place_algo_order(
+            symbol=symbol,
+            side=side,
+            order_type='TAKE_PROFIT_MARKET',
+            quantity=quantity,
+            trigger_price=trigger_price,
+            reduce_only=reduce_only
+        )
+
+    async def place_trailing_stop_algo(self, symbol: str, side: OrderSide,
+                                       quantity: float, callback_rate: float,
+                                       activate_price: float = None,
+                                       reduce_only: bool = True) -> Dict:
+        """
+        Place trailing stop using Algo API
+
+        Args:
+            callback_rate: Callback rate in percent (e.g., 1.0 = 1%)
+            activate_price: Price at which trailing stop activates
+        """
+        return await self.place_algo_order(
+            symbol=symbol,
+            side=side,
+            order_type='TRAILING_STOP_MARKET',
+            quantity=quantity,
+            trigger_price=activate_price or 0,  # Will use current price if not set
+            callback_rate=callback_rate,
+            activate_price=activate_price,
+            reduce_only=reduce_only
+        )
 
 
 class BinanceWebSocket:
