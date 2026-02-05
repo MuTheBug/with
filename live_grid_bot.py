@@ -717,6 +717,8 @@ class LiveGridBot:
             price = round(price / tick_size) * tick_size
             price = round(price, price_precision)
 
+            # Counter orders should NOT be reduce_only - they're part of the grid strategy
+            # reduce_only would reject if there's no position to reduce
             await self.client.rest.place_order(
                 symbol=self.config.symbol,
                 side=OrderSide.BUY if side == 'BUY' else OrderSide.SELL,
@@ -724,7 +726,7 @@ class LiveGridBot:
                 quantity=quantity,
                 price=price,
                 time_in_force=TimeInForce.GTC,
-                reduce_only=self.config.reduce_only_exits
+                reduce_only=False  # Grid counter orders open/add positions
             )
             logger.info(f"Placed counter {side} order at ${price:.{price_precision}f}")
         except Exception as e:
