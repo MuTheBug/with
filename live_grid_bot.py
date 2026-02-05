@@ -19,6 +19,7 @@ import asyncio
 import json
 import time
 import os
+import random
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -383,6 +384,12 @@ class OrderManager:
     async def place_stop_loss(self, position: Position) -> bool:
         """Place stop-loss order for a position"""
         try:
+            # Get symbol-specific precision
+            sym_config = get_symbol_config(self.config.symbol)
+            tick_size = sym_config['tick_size']
+            qty_precision = sym_config['qty_precision']
+            price_precision = sym_config['price_precision']
+
             if position.side == 'LONG':
                 stop_price = position.entry_price * (1 - self.config.position_stop_loss_pct / 100)
                 side = OrderSide.SELL
@@ -390,16 +397,21 @@ class OrderManager:
                 stop_price = position.entry_price * (1 + self.config.position_stop_loss_pct / 100)
                 side = OrderSide.BUY
 
+            # Round to tick size
+            stop_price = round(stop_price / tick_size) * tick_size
+            stop_price = round(stop_price, price_precision)
+            quantity = round(abs(position.quantity), qty_precision)
+
             await self.rest.place_order(
                 symbol=self.config.symbol,
                 side=side,
                 order_type=OrderType.STOP_MARKET,
-                quantity=abs(position.quantity),
-                stop_price=round(stop_price, 2),
+                quantity=quantity,
+                stop_price=stop_price,
                 reduce_only=True
             )
 
-            logger.info(f"Placed stop-loss at {stop_price}")
+            logger.info(f"Placed stop-loss at ${stop_price:.{price_precision}f}")
             return True
 
         except Exception as e:
@@ -409,6 +421,12 @@ class OrderManager:
     async def place_take_profit(self, position: Position) -> bool:
         """Place take-profit order for a position"""
         try:
+            # Get symbol-specific precision
+            sym_config = get_symbol_config(self.config.symbol)
+            tick_size = sym_config['tick_size']
+            qty_precision = sym_config['qty_precision']
+            price_precision = sym_config['price_precision']
+
             if position.side == 'LONG':
                 tp_price = position.entry_price * (1 + self.config.take_profit_pct / 100)
                 side = OrderSide.SELL
@@ -416,16 +434,21 @@ class OrderManager:
                 tp_price = position.entry_price * (1 - self.config.take_profit_pct / 100)
                 side = OrderSide.BUY
 
+            # Round to tick size
+            tp_price = round(tp_price / tick_size) * tick_size
+            tp_price = round(tp_price, price_precision)
+            quantity = round(abs(position.quantity), qty_precision)
+
             await self.rest.place_order(
                 symbol=self.config.symbol,
                 side=side,
                 order_type=OrderType.TAKE_PROFIT_MARKET,
-                quantity=abs(position.quantity),
-                stop_price=round(tp_price, 2),
+                quantity=quantity,
+                stop_price=tp_price,
                 reduce_only=True
             )
 
-            logger.info(f"Placed take-profit at {tp_price}")
+            logger.info(f"Placed take-profit at ${tp_price:.{price_precision}f}")
             return True
 
         except Exception as e:
@@ -607,20 +630,55 @@ class LiveGridBot:
         return success_count > 0
 
     async def handle_price_update(self, data: Dict):
-        """Handle real-time price update"""
-        if 'p' in data:  # Trade data
-            self.current_price = float(data['p'])
-        elif 'c' in data:  # Ticker data
-            self.current_price = float(data['c'])
+        """Handle real-time price update from ticker stream"""
+        new_price = 0.0
 
+        # Binance ticker stream format:
+        # 'c' = last price (current price) - USE THIS
+        # 'p' = price change (NOT the current price!)
+        # For ticker stream, always use 'c'
+        if 'c' in data:
+            new_price = float(data['c'])
+
+        # Validate price before updating
+        if new_price <= 0:
+            return  # Invalid price, ignore
+
+        # Sanity check: if we have a valid grid center, new price shouldn't be wildly different
+        # (prevents parsing errors from corrupting our state)
+        if self.grid_center > 0:
+            price_diff_pct = abs(new_price - self.grid_center) / self.grid_center * 100
+            if price_diff_pct > 50:  # More than 50% difference is likely a parsing error
+                logger.warning(f"Suspicious price {new_price} (grid center: {self.grid_center}), ignoring")
+                return
+
+        # Only log occasionally to avoid spam (every ~50 updates)
+        if random.random() < 0.02:
+            logger.debug(f"Price update: ${new_price:.4f}")
+
+        self.current_price = new_price
         self.risk_manager.update_price(self.current_price)
 
         # Check if grid needs rebalancing
-        if self.grid_center > 0:
+        if self.grid_center > 0 and self.current_price > 0:
             price_change = abs(self.current_price - self.grid_center) / self.grid_center * 100
             if price_change >= self.config.rebalance_threshold_pct:
                 logger.info(f"Price moved {price_change:.2f}% from grid center, rebalancing...")
                 await self.rebalance_grid()
+
+    async def handle_mark_price_update(self, data: Dict):
+        """Handle mark price updates from WebSocket"""
+        # Mark price stream format:
+        # 'p' = mark price
+        # 'i' = index price
+        # 'r' = funding rate
+        if 'p' in data:
+            mark_price = float(data['p'])
+            if mark_price > 0:
+                # Use mark price as backup if we don't have a current price yet
+                if self.current_price <= 0:
+                    self.current_price = mark_price
+                    logger.info(f"Set initial price from mark price: ${mark_price}")
 
     async def handle_order_update(self, data: Dict):
         """Handle order update from WebSocket"""
@@ -648,16 +706,27 @@ class LiveGridBot:
     async def _place_counter_order(self, side: str, price: float, quantity: float):
         """Place counter order after a fill"""
         try:
+            # Get symbol-specific precision
+            sym_config = get_symbol_config(self.config.symbol)
+            tick_size = sym_config['tick_size']
+            qty_precision = sym_config['qty_precision']
+            price_precision = sym_config['price_precision']
+
+            # Round to proper precision
+            quantity = round(quantity, qty_precision)
+            price = round(price / tick_size) * tick_size
+            price = round(price, price_precision)
+
             await self.client.rest.place_order(
                 symbol=self.config.symbol,
                 side=OrderSide.BUY if side == 'BUY' else OrderSide.SELL,
                 order_type=OrderType.LIMIT,
-                quantity=round(quantity, 3),
-                price=round(price, 2),
+                quantity=quantity,
+                price=price,
                 time_in_force=TimeInForce.GTC,
                 reduce_only=self.config.reduce_only_exits
             )
-            logger.info(f"Placed counter {side} order at {price:.2f}")
+            logger.info(f"Placed counter {side} order at ${price:.{price_precision}f}")
         except Exception as e:
             logger.error(f"Failed to place counter order: {e}")
 
@@ -765,6 +834,7 @@ class LiveGridBot:
 
         # Subscribe to WebSocket events
         self.client.ws.subscribe('ticker', self.handle_price_update)
+        self.client.ws.subscribe('markPrice', self.handle_mark_price_update)
         self.client.ws.subscribe('order_update', self.handle_order_update)
         self.client.ws.subscribe('account_update', self.handle_account_update)
 
